@@ -1,0 +1,15 @@
+[package]
+name = "wit-bindgen-gen-host-wasmtime-csharp"
+version.workspace = true
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+wit-bindgen-core = { workspace = true }
+wit-component = { workspace = true }
+heck = { workspace = true }
+clap = { workspace = true, optional = true }
+
+[dev-dependencies]
+test-helpers = { path = '../test-helpers', default-features = false, features = ['macros'] }
