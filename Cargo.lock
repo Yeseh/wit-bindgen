@@ -1956,6 +1956,7 @@ dependencies = [
  "wit-bindgen-gen-guest-rust",
  "wit-bindgen-gen-guest-teavm-java",
  "wit-bindgen-gen-host-js",
+ "wit-bindgen-gen-host-wasmtime-csharp",
  "wit-bindgen-gen-host-wasmtime-rust",
  "wit-bindgen-gen-markdown",
  "wit-component",
@@ -2037,6 +2038,17 @@ dependencies = [
  "indexmap",
  "test-helpers",
  "wasmtime-environ",
+ "wit-bindgen-core",
+ "wit-component",
+]
+
+[[package]]
+name = "wit-bindgen-gen-host-wasmtime-csharp"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "heck",
+ "test-helpers",
  "wit-bindgen-core",
  "wit-component",
 ]
