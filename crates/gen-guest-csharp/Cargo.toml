@@ -1,5 +1,5 @@
 [package]
-name = "wit-bindgen-gen-host-wasmtime-csharp"
+name = "wit-bindgen-gen-guest-csharp"
 version.workspace = true
 edition.workspace = true
 
