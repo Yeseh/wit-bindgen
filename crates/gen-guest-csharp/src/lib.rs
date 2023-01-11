@@ -25,6 +25,7 @@ pub struct Opts {
     generate_stub: bool,
 }
 
+#[derive(Default)]
 pub struct CSharp {
     opts: Opts,
     name: String,
@@ -36,7 +37,14 @@ pub struct CSharp {
     classes: HashMap<String, String>,
 }
 
-impl Opts {}
+impl Opts {
+    pub fn build(&self) -> Box<dyn WorldGenerator> {
+        Box::new(CSharp {
+            opts: self.clone(),
+            ..CSharp::default()
+        })
+    }
+}
 
 impl CSharp {
     fn qualifier(&self) -> String {
@@ -87,17 +95,66 @@ impl WorldGenerator for CSharp {
     }
 
     fn export_default(&mut self, name: &str, iface: &Interface, files: &mut Files) {
-        todo!()
+        let mut gen = self.interface(iface, name);
+        gen.types();
+
+        for func in iface.functions.iter() {
+            gen.export(func, None);
+        }
+
+        gen.add_class();
     }
 
     fn finish(&mut self, world: &World, files: &mut Files) {
-        todo!()
+        let namespace = format!("wit_{}", world.name.to_snake_case());
+        let name = world.name.to_upper_camel_case();
+
+        let mut src = String::new();
+
+        uwrite!(
+            src,
+            "namespace {namespace};
+
+            {USINGS}
+
+            public sealed class {name}World 
+            {{
+                private {name}World() {{}}
+            }}
+            "
+        );
+
+        if self.needs_result {
+            // TODO: Write result class
+        }
+
+        if self.needs_cleanup {
+            // TODO: Write cleanup class
+        }
+
+        if self.return_area_align > 0 {
+            let size = self.return_area_size;
+            let align = self.return_area_align;
+
+            // TODO: 
+            uwriteln!(
+                src,
+                "public static IntPtr RETURN_AREA = GCHandle.alloc() "
+            )
+        }
+
+        src.push_str("}\n");
+        files.push(&format!("{name}World.cs"), indent(&src).as_bytes());
+        
+        for (name, body) in &self.classes {
+            files.push(&format!("{name}.cs"), indent(body).as_bytes());
+        }
     }
 }
 
 pub struct InterfaceGenerator<'a> {
     src: String,
-    // From java guest, might need this
+    // TODO: From java guest, might need this
     // stub: String
     sizes: SizeAlign,
     gen: &'a mut CSharp,
@@ -124,7 +181,8 @@ impl InterfaceGenerator<'_> {
 
             {USINGS}
 
-            public sealed class {name} {{
+            public sealed class {name} 
+            {{
                 private {name}() {{}}
 
                 {body}
@@ -193,7 +251,8 @@ impl InterfaceGenerator<'_> {
             r#"
                 public static extern {result_type} {camel_name}({params});
 
-                {sig} {{
+                {sig} 
+                {{
                     {cleanup_list} {src}
                 }}
             "#
@@ -244,7 +303,8 @@ impl InterfaceGenerator<'_> {
         uwrite!(
             self.src,
             r#"
-            public static {result_type} {camel_name}({params}) {{
+            public static {result_type} {camel_name}({params}) 
+            {{
                 {src}
             }}
             "#
@@ -322,6 +382,7 @@ impl InterfaceGenerator<'_> {
                                 tuple
                                     .types
                                     .iter()
+                                    // TODO: check boxed primitives
                                     .map(|ty| self.type_name_boxed(ty, qualifier))
                                     .collect::<Vec<_>>()
                                     .join(", ")
@@ -363,7 +424,7 @@ impl InterfaceGenerator<'_> {
         }
     }
 
-    // TODO: I think these are java specific, C# doesn't have boxed primitives afaik
+    // TODO: I think these are java specific, C# doesn't generally use boxed primitives
     fn type_name_boxed(&mut self, ty: &Type, qualifier: bool) -> String {
         match ty {
             Type::Bool => "Boolean".into(),
@@ -429,13 +490,13 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
     fn type_record(&mut self, id: TypeId, name: &str, record: &Record, docs: &Docs) {
         self.print_docs(docs);
 
-        let parameters = record.fields.iter().map(|field| {
-            format!(
-                "{} {}",
-                self.type_name(&field.ty),
-                field.name.to_lower_camel_case()
-            )
-        });
+        // let parameters = record.fields.iter().map(|field| {
+        //     format!(
+        //         "{} {}",
+        //         self.type_name(&field.ty),
+        //         field.name.to_lower_camel_case()
+        //     )
+        // });
 
         let fields = record
             .fields
@@ -464,22 +525,104 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
     }
 
     fn type_tuple(&mut self, id: TypeId, name: &str, flags: &Tuple, docs: &Docs) {
-        // TODO: Whats this?
         self.type_name(&Type::Id(id));
     }
 
     fn type_variant(&mut self, id: TypeId, name: &str, variant: &Variant, docs: &Docs) {
-        // TODO: Whats this?
-        todo!()
+        self.print_docs(docs);
+
+        let name = name.to_upper_camel_case();
+        let tag_type = int_type(variant.tag());
+
+        let constructors = variant
+            .cases
+            .iter()
+            .map(|case| {
+                let case_name = case.name.to_lower_camel_case();
+                let tag = case.name.to_shouty_snake_case();
+                let (parameter, argument) = if let Some(ty) = self.non_empty_type(case.ty.as_ref()) {
+                    (
+                        format!("{} {case_name}", self.type_name(ty)),
+                        case_name.deref(),
+                    )
+                }
+                else {
+                    (String::new(), "null")
+                };
+
+                format!("public {name} {case_name}({parameter}) 
+                {{
+                    return new {name}({tag}, {argument})
+                }}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let accessors = variant
+            .cases
+            .iter()
+            .filter_map(|case| {
+                self.non_empty_type(case.ty.as_ref()).map(|ty| {
+                    let case_name = case.name.to_upper_camel_case();
+                    let tag = case.name.to_shouty_snake_case();
+                    let ty = self.type_name(ty);
+                    format!(
+                        r#"public {ty} Get{case_name}() {{
+                            if (this.tag = {tag}) 
+                            {{
+                                return ({ty}) this.value;
+                            }}
+                            else
+                            {{
+                                throw new Exception($"Expected {tag}, got " + this.tag);
+                            }}
+                        }}"#
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let tags = variant
+            .cases
+            .iter()
+            .enumerate()
+            .map(|(i, case)| {
+                let tag = case.name.to_shouty_snake_case();
+                format!("public static {tag_type} {tag} = {i}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        uwrite!(
+            self.src,
+            "
+            public static sealed class {name}
+            {{
+                public {tag_type} Tag;
+
+                private object value;
+
+                private {name}({tag_type} tag, object value)
+                {{
+                    this.Tag = tag;
+                    this.value = value;
+                }}
+
+                {constructors}
+                {accessors}
+                {tags}
+            }}
+            "
+        )
+            
     }
 
     fn type_option(&mut self, id: TypeId, name: &str, payload: &Type, docs: &Docs) {
-        // TODO: Whats this?
         self.type_name(&Type::Id(id));
     }
 
     fn type_result(&mut self, id: TypeId, name: &str, result: &Result_, docs: &Docs) {
-        // TODO: Whats this?
         self.type_name(&Type::Id(id));
     }
 
@@ -519,7 +662,8 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         uwrite!(
             self.src,
             "
-            public enum {name} {{
+            public enum {name} 
+            {{
                 {cases}
             }}
             "
@@ -527,12 +671,10 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
     }
 
     fn type_alias(&mut self, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
-        // TODO: Whats this?
         self.type_name(&Type::Id(id));
     }
 
     fn type_list(&mut self, id: TypeId, name: &str, ty: &Type, docs: &Docs) {
-        // TODO: Whats this?
         self.type_name(&Type::Id(id));
     }
 

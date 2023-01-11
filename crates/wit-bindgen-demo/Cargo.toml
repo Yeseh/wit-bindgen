@@ -16,6 +16,7 @@ wit-bindgen-core = { workspace = true }
 wit-bindgen-gen-guest-rust = { workspace = true }
 wit-bindgen-gen-host-js = { workspace = true }
 wit-bindgen-gen-guest-c = { workspace = true }
+wit-bindgen-gen-guest-csharp = { workspace = true }
 wit-bindgen-gen-guest-teavm-java = { workspace = true }
 wit-bindgen-gen-markdown = { workspace = true }
 wit-bindgen-guest-rust = { workspace = true, features = ['default'] }
