@@ -15,10 +15,6 @@ use wit_bindgen_core::{
     Files, InterfaceGenerator as _, Ns, WorldGenerator,
 };
 
-const USINGS: &str = "\
-using Wasmtime;
-";
-
 #[derive(Default, Debug, Clone)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct Opts {
@@ -136,16 +132,13 @@ impl WorldGenerator for CSharp {
             let size = self.return_area_size;
             let align = self.return_area_align;
 
-            // TODO: 
-            uwriteln!(
-                src,
-                "public static IntPtr RETURN_AREA = GCHandle.alloc() "
-            )
+            // TODO:
+            uwriteln!(src, "public static IntPtr RETURN_AREA = GCHandle.alloc() ")
         }
 
         src.push_str("}\n");
         files.push(&format!("{name}World.cs"), indent(&src).as_bytes());
-        
+
         for (name, body) in &self.classes {
             files.push(&format!("{name}.cs"), indent(body).as_bytes());
         }
@@ -540,20 +533,22 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             .map(|case| {
                 let case_name = case.name.to_lower_camel_case();
                 let tag = case.name.to_shouty_snake_case();
-                let (parameter, argument) = if let Some(ty) = self.non_empty_type(case.ty.as_ref()) {
+                let (parameter, argument) = if let Some(ty) = self.non_empty_type(case.ty.as_ref())
+                {
                     (
                         format!("{} {case_name}", self.type_name(ty)),
                         case_name.deref(),
                     )
-                }
-                else {
+                } else {
                     (String::new(), "null")
                 };
 
-                format!("public {name} {case_name}({parameter}) 
+                format!(
+                    "public {name} {case_name}({parameter}) 
                 {{
                     return new {name}({tag}, {argument})
-                }}")
+                }}"
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -615,7 +610,6 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             }}
             "
         )
-            
     }
 
     fn type_option(&mut self, id: TypeId, name: &str, payload: &Type, docs: &Docs) {

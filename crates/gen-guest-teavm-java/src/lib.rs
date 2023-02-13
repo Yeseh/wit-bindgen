@@ -9,8 +9,9 @@ use wit_bindgen_core::{
     uwrite, uwriteln,
     wit_parser::{
         abi::{AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType},
-        Case, Docs, Enum, Flags, FlagsRepr, Function, FunctionKind, Int, Interface, Record,
-        Result_, SizeAlign, Tuple, Type, TypeDefKind, TypeId, Union, Variant, World,
+        Case, Docs, Enum, Flags, FlagsRepr, Function, FunctionKind, Int, InterfaceId, Record,
+        Resolve, Result_, SizeAlign, Tuple, Type, TypeDef, TypeDefKind, TypeId, TypeOwner, Union,
+        Variant, WorldId,
     },
     Files, InterfaceGenerator as _, Ns, WorldGenerator,
 };
@@ -42,6 +43,11 @@ impl Opts {
     }
 }
 
+struct InterfaceFragment {
+    src: String,
+    stub: String,
+}
+
 #[derive(Default)]
 pub struct TeaVmJava {
     opts: Opts,
@@ -51,7 +57,10 @@ pub struct TeaVmJava {
     tuple_counts: HashSet<usize>,
     needs_cleanup: bool,
     needs_result: bool,
-    classes: HashMap<String, String>,
+    interface_fragments: HashMap<String, Vec<InterfaceFragment>>,
+    world_fragments: Vec<InterfaceFragment>,
+    sizes: SizeAlign,
+    interface_names: HashMap<InterfaceId, String>,
 }
 
 impl TeaVmJava {
@@ -60,59 +69,113 @@ impl TeaVmJava {
         format!("{world}World.")
     }
 
-    fn interface<'a>(&'a mut self, iface: &'a Interface, name: &'a str) -> InterfaceGenerator<'a> {
-        let mut sizes = SizeAlign::default();
-        sizes.fill(iface);
+    fn interface<'a>(&'a mut self, resolve: &'a Resolve, name: &'a str) -> InterfaceGenerator<'a> {
         InterfaceGenerator {
             src: String::new(),
             stub: String::new(),
             gen: self,
-            iface,
-            sizes,
+            resolve,
             name,
         }
     }
 }
 
 impl WorldGenerator for TeaVmJava {
-    fn preprocess(&mut self, name: &str) {
+    fn preprocess(&mut self, resolve: &Resolve, world: WorldId) {
+        let name = &resolve.worlds[world].name;
         self.name = name.to_string();
+        self.sizes.fill(resolve);
     }
 
-    fn import(&mut self, name: &str, iface: &Interface, _files: &mut Files) {
-        let mut gen = self.interface(iface, name);
-        gen.types();
+    fn import_interface(
+        &mut self,
+        resolve: &Resolve,
+        name: &str,
+        id: InterfaceId,
+        _files: &mut Files,
+    ) {
+        self.interface_names.insert(id, name.to_owned());
+        let mut gen = self.interface(resolve, name);
+        gen.types(id);
 
-        for func in iface.functions.iter() {
+        for (_, func) in resolve.interfaces[id].functions.iter() {
             gen.import(name, func);
         }
 
-        gen.add_class();
+        gen.add_interface_fragment();
     }
 
-    fn export(&mut self, name: &str, iface: &Interface, _files: &mut Files) {
-        let mut gen = self.interface(iface, name);
-        gen.types();
+    fn import_funcs(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        funcs: &[(&str, &Function)],
+        _files: &mut Files,
+    ) {
+        let name = &format!("{}-world", resolve.worlds[world].name);
+        let mut gen = self.interface(resolve, name);
 
-        for func in iface.functions.iter() {
+        for (_, func) in funcs {
+            gen.import(name, func);
+        }
+
+        gen.add_world_fragment();
+    }
+
+    fn export_interface(
+        &mut self,
+        resolve: &Resolve,
+        name: &str,
+        id: InterfaceId,
+        _files: &mut Files,
+    ) {
+        self.interface_names.insert(id, name.to_owned());
+        let mut gen = self.interface(resolve, name);
+        gen.types(id);
+
+        for (_, func) in resolve.interfaces[id].functions.iter() {
             gen.export(func, Some(name));
         }
 
-        gen.add_class();
+        gen.add_interface_fragment();
     }
 
-    fn export_default(&mut self, name: &str, iface: &Interface, _files: &mut Files) {
-        let mut gen = self.interface(iface, name);
-        gen.types();
+    fn export_funcs(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        funcs: &[(&str, &Function)],
+        _files: &mut Files,
+    ) {
+        let name = &format!("{}-world", resolve.worlds[world].name);
+        let mut gen = self.interface(resolve, name);
 
-        for func in iface.functions.iter() {
+        for (_, func) in funcs {
             gen.export(func, None);
         }
 
-        gen.add_class();
+        gen.add_world_fragment();
     }
 
-    fn finish(&mut self, world: &World, files: &mut Files) {
+    fn export_types(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        types: &[(&str, TypeId)],
+        _files: &mut Files,
+    ) {
+        let name = &format!("{}-world", resolve.worlds[world].name);
+        let mut gen = self.interface(resolve, name);
+
+        for (ty_name, ty) in types {
+            gen.define_type(ty_name, *ty);
+        }
+
+        gen.add_world_fragment();
+    }
+
+    fn finish(&mut self, resolve: &Resolve, id: WorldId, files: &mut Files) {
+        let world = &resolve.worlds[id];
         let package = format!("wit_{}", world.name.to_snake_case());
         let name = world.name.to_upper_camel_case();
 
@@ -130,8 +193,18 @@ impl WorldGenerator for TeaVmJava {
             "
         );
 
+        src.push_str(
+            &self
+                .world_fragments
+                .iter()
+                .map(|f| f.src.deref())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
         let component_type =
-            wit_component::metadata::encode(world, wit_component::StringEncoding::UTF8)
+            wit_component::metadata::encode(resolve, id, wit_component::StringEncoding::UTF8)
+                .unwrap()
                 .into_iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<Vec<_>>()
@@ -267,51 +340,13 @@ impl WorldGenerator for TeaVmJava {
 
         files.push(&format!("{name}World.java"), indent(&src).as_bytes());
 
-        for (name, body) in &self.classes {
-            files.push(&format!("{name}.java"), indent(body).as_bytes());
-        }
-    }
-}
+        let generate_stub = |name, fragments: &[InterfaceFragment], files: &mut Files| {
+            let body = fragments
+                .iter()
+                .map(|f| f.stub.deref())
+                .collect::<Vec<_>>()
+                .join("\n");
 
-struct InterfaceGenerator<'a> {
-    src: String,
-    stub: String,
-    sizes: SizeAlign,
-    gen: &'a mut TeaVmJava,
-    iface: &'a Interface,
-    name: &'a str,
-}
-
-impl InterfaceGenerator<'_> {
-    fn qualifier(&self, when: bool) -> String {
-        if when {
-            let iface = self.name.to_upper_camel_case();
-            format!("{iface}.")
-        } else {
-            String::new()
-        }
-    }
-
-    fn add_class(self) {
-        let package = format!("wit_{}", self.gen.name.to_snake_case());
-        let name = self.name.to_upper_camel_case();
-        let body = self.src;
-        let body = format!(
-            "package {package};
-
-             {IMPORTS}
-
-             public final class {name} {{
-                 private {name}() {{}}
-
-                 {body}
-             }}
-            "
-        );
-
-        if self.gen.opts.generate_stub {
-            let name = format!("{name}Impl");
-            let body = self.stub;
             let body = format!(
                 "package {package};
 
@@ -323,10 +358,84 @@ impl InterfaceGenerator<'_> {
                 "
             );
 
-            self.gen.classes.insert(name, body);
+            files.push(&format!("{name}.java"), indent(&body).as_bytes());
+        };
+
+        if self.opts.generate_stub {
+            generate_stub(format!("{name}WorldImpl"), &self.world_fragments, files);
         }
 
-        self.gen.classes.insert(name, body);
+        for (name, fragments) in &self.interface_fragments {
+            let body = fragments
+                .iter()
+                .map(|f| f.src.deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let body = format!(
+                "package {package};
+
+                 {IMPORTS}
+
+                 public final class {name} {{
+                     private {name}() {{}}
+
+                     {body}
+                 }}
+                "
+            );
+
+            files.push(&format!("{name}.java"), indent(&body).as_bytes());
+
+            if self.opts.generate_stub {
+                generate_stub(format!("{name}Impl"), fragments, files);
+            }
+        }
+    }
+}
+
+struct InterfaceGenerator<'a> {
+    src: String,
+    stub: String,
+    gen: &'a mut TeaVmJava,
+    resolve: &'a Resolve,
+    name: &'a str,
+}
+
+impl InterfaceGenerator<'_> {
+    fn qualifier(&self, when: bool, ty: &TypeDef) -> String {
+        if let TypeOwner::Interface(id) = &ty.owner {
+            if let Some(name) = self.gen.interface_names.get(id) {
+                if name != self.name {
+                    return format!("{}.", name.to_upper_camel_case());
+                }
+            }
+        }
+
+        if when {
+            let name = self.name.to_upper_camel_case();
+            format!("{name}.")
+        } else {
+            String::new()
+        }
+    }
+
+    fn add_interface_fragment(self) {
+        self.gen
+            .interface_fragments
+            .entry(self.name.to_upper_camel_case())
+            .or_default()
+            .push(InterfaceFragment {
+                src: self.src,
+                stub: self.stub,
+            });
+    }
+
+    fn add_world_fragment(self) {
+        self.gen.world_fragments.push(InterfaceFragment {
+            src: self.src,
+            stub: self.stub,
+        });
     }
 
     fn import(&mut self, module: &str, func: &Function) {
@@ -337,10 +446,13 @@ impl InterfaceGenerator<'_> {
         let mut bindgen = FunctionBindgen::new(
             self,
             &func.name,
-            func.params.iter().map(|(name, _)| name.clone()).collect(),
+            func.params
+                .iter()
+                .map(|(name, _)| name.to_java_ident())
+                .collect(),
         );
 
-        bindgen.gen.iface.call(
+        bindgen.gen.resolve.call(
             AbiVariant::GuestImport,
             LiftLower::LowerArgsLiftResults,
             func,
@@ -362,7 +474,7 @@ impl InterfaceGenerator<'_> {
 
         let name = &func.name;
 
-        let sig = self.iface.wasm_signature(AbiVariant::GuestImport, func);
+        let sig = self.resolve.wasm_signature(AbiVariant::GuestImport, func);
 
         let result_type = match &sig.results[..] {
             [] => "void",
@@ -398,7 +510,7 @@ impl InterfaceGenerator<'_> {
     }
 
     fn export(&mut self, func: &Function, interface_name: Option<&str>) {
-        let sig = self.iface.wasm_signature(AbiVariant::GuestExport, func);
+        let sig = self.resolve.wasm_signature(AbiVariant::GuestExport, func);
 
         let export_name = func.core_export_name(interface_name);
 
@@ -408,7 +520,7 @@ impl InterfaceGenerator<'_> {
             (0..sig.params.len()).map(|i| format!("p{i}")).collect(),
         );
 
-        bindgen.gen.iface.call(
+        bindgen.gen.resolve.call(
             AbiVariant::GuestExport,
             LiftLower::LiftArgsLowerResults,
             func,
@@ -448,7 +560,7 @@ impl InterfaceGenerator<'_> {
             "#
         );
 
-        if self.iface.guest_export_needs_post_return(func) {
+        if self.resolve.guest_export_needs_post_return(func) {
             let params = sig
                 .results
                 .iter()
@@ -466,7 +578,7 @@ impl InterfaceGenerator<'_> {
                 (0..sig.results.len()).map(|i| format!("p{i}")).collect(),
             );
 
-            bindgen.gen.iface.post_return(func, &mut bindgen);
+            bindgen.gen.resolve.post_return(func, &mut bindgen);
 
             let src = bindgen.src;
 
@@ -510,7 +622,7 @@ impl InterfaceGenerator<'_> {
             Type::Float64 => "double".into(),
             Type::String => "String".into(),
             Type::Id(id) => {
-                let ty = &self.iface.types[*id];
+                let ty = &self.resolve.types[*id];
                 match &ty.kind {
                     TypeDefKind::Type(ty) => self.type_name_with_qualifier(ty, qualifier),
                     TypeDefKind::List(ty) => {
@@ -561,7 +673,7 @@ impl InterfaceGenerator<'_> {
                         if let Some(name) = &ty.name {
                             format!(
                                 "{}{}",
-                                self.qualifier(qualifier),
+                                self.qualifier(qualifier, ty),
                                 name.to_upper_camel_case()
                             )
                         } else {
@@ -583,7 +695,7 @@ impl InterfaceGenerator<'_> {
             Type::Float32 => "Float".into(),
             Type::Float64 => "Double".into(),
             Type::Id(id) => {
-                let def = &self.iface.types[*id];
+                let def = &self.resolve.types[*id];
                 match &def.kind {
                     TypeDefKind::Type(ty) => self.type_name_boxed(ty, qualifier),
                     _ => self.type_name_with_qualifier(ty, qualifier),
@@ -619,7 +731,7 @@ impl InterfaceGenerator<'_> {
                 Type::Id(id) => *id,
                 _ => return Some(ty),
             };
-            match &self.iface.types[id].kind {
+            match &self.resolve.types[id].kind {
                 TypeDefKind::Type(t) => self.non_empty_type(Some(t)).map(|_| ty),
                 TypeDefKind::Record(r) => (!r.fields.is_empty()).then_some(ty),
                 TypeDefKind::Tuple(t) => (!t.types.is_empty()).then_some(ty),
@@ -631,7 +743,7 @@ impl InterfaceGenerator<'_> {
     }
 
     fn sig_string(&mut self, func: &Function, qualifier: bool) -> String {
-        let name = func.name.to_lower_camel_case();
+        let name = func.name.to_java_ident();
 
         let result_type = match func.results.len() {
             0 => "void".into(),
@@ -657,7 +769,7 @@ impl InterfaceGenerator<'_> {
             .iter()
             .map(|(name, ty)| {
                 let ty = self.type_name_with_qualifier(ty, qualifier);
-                let name = name.to_lower_camel_case();
+                let name = name.to_java_ident();
                 format!("{ty} {name}")
             })
             .collect::<Vec<_>>()
@@ -668,8 +780,8 @@ impl InterfaceGenerator<'_> {
 }
 
 impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
-    fn iface(&self) -> &'a Interface {
-        self.iface
+    fn resolve(&self) -> &'a Resolve {
+        self.resolve
     }
 
     fn type_record(&mut self, _id: TypeId, name: &str, record: &Record, docs: &Docs) {
@@ -684,7 +796,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 format!(
                     "{} {}",
                     self.type_name(&field.ty),
-                    field.name.to_lower_camel_case()
+                    field.name.to_java_ident()
                 )
             })
             .collect::<Vec<_>>()
@@ -694,24 +806,28 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             .fields
             .iter()
             .map(|field| {
-                let name = field.name.to_lower_camel_case();
+                let name = field.name.to_java_ident();
                 format!("this.{name} = {name};")
             })
             .collect::<Vec<_>>()
             .join("\n");
 
-        let fields = record
-            .fields
-            .iter()
-            .map(|field| {
-                format!(
-                    "public final {} {};",
-                    self.type_name(&field.ty),
-                    field.name.to_lower_camel_case()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let fields = if record.fields.is_empty() {
+            format!("public static final {name} INSTANCE = new {name}();")
+        } else {
+            record
+                .fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "public final {} {};",
+                        self.type_name(&field.ty),
+                        field.name.to_java_ident()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
         uwrite!(
             self.src,
@@ -788,7 +904,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             .cases
             .iter()
             .map(|case| {
-                let case_name = case.name.to_lower_camel_case();
+                let case_name = case.name.to_java_ident();
                 let tag = case.name.to_shouty_snake_case();
                 let (parameter, argument) = if let Some(ty) = self.non_empty_type(case.ty.as_ref())
                 {
@@ -1085,12 +1201,16 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
                 let payload = if self.gen.non_empty_type(case_ty.as_ref()).is_some() {
                     results.into_iter().next().unwrap()
                 } else if generics_position.is_some() {
-                    format!("{}Tuple0.INSTANCE", self.gen.gen.qualifier())
+                    if let Some(ty) = case_ty.as_ref() {
+                        format!("{}.INSTANCE", self.gen.type_name(ty))
+                    } else {
+                        format!("{}Tuple0.INSTANCE", self.gen.gen.qualifier())
+                    }
                 } else {
                     String::new()
                 };
 
-                let method = case_name.to_lower_camel_case();
+                let method = case_name.to_java_ident();
 
                 let call = if let Some(position) = generics_position {
                     let (ty, generics) = ty.split_at(position);
@@ -1132,7 +1252,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
 
     fn emit(
         &mut self,
-        _iface: &Interface,
+        _resolve: &Resolve,
         inst: &Instruction<'_>,
         operands: &mut Vec<String>,
         results: &mut Vec<String>,
@@ -1231,7 +1351,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             Instruction::RecordLower { record, .. } => {
                 let op = &operands[0];
                 for field in record.fields.iter() {
-                    results.push(format!("({op}).{}", field.name.to_lower_camel_case()));
+                    results.push(format!("({op}).{}", field.name.to_java_ident()));
                 }
             }
             Instruction::RecordLift { ty, .. } | Instruction::TupleLift { ty, .. } => {
@@ -1561,8 +1681,8 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 assert!(block_results.is_empty());
 
                 let op = &operands[0];
-                let size = self.gen.sizes.size(element);
-                let align = self.gen.sizes.align(element);
+                let size = self.gen.gen.sizes.size(element);
+                let align = self.gen.gen.sizes.align(element);
                 let address = self.locals.tmp("address");
                 let ty = self.gen.type_name(element);
                 let index = self.locals.tmp("index");
@@ -1602,8 +1722,8 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 let length = &operands[1];
                 let array = self.locals.tmp("array");
                 let ty = self.gen.type_name(element);
-                let size = self.gen.sizes.size(element);
-                let align = self.gen.sizes.align(element);
+                let size = self.gen.gen.sizes.size(element);
+                let align = self.gen.gen.sizes.align(element);
                 let index = self.locals.tmp("index");
 
                 let result = match &block_results[..] {
@@ -1703,7 +1823,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 };
 
                 let module = self.gen.name.to_upper_camel_case();
-                let name = func.name.to_lower_camel_case();
+                let name = func.name.to_java_ident();
 
                 let args = operands.join(", ");
 
@@ -1896,8 +2016,8 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 let address = &operands[0];
                 let length = &operands[1];
 
-                let size = self.gen.sizes.size(element);
-                let align = self.gen.sizes.align(element);
+                let size = self.gen.gen.sizes.size(element);
+                let align = self.gen.gen.sizes.align(element);
 
                 if !body.trim().is_empty() {
                     let index = self.locals.tmp("index");
@@ -1921,7 +2041,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
         }
     }
 
-    fn return_pointer(&mut self, _iface: &Interface, size: usize, align: usize) -> String {
+    fn return_pointer(&mut self, size: usize, align: usize) -> String {
         self.gen.gen.return_area_size = self.gen.gen.return_area_size.max(size);
         self.gen.gen.return_area_align = self.gen.gen.return_area_align.max(align);
         format!("{}RETURN_AREA", self.gen.gen.qualifier())
@@ -1972,10 +2092,10 @@ impl Bindgen for FunctionBindgen<'_, '_> {
     }
 
     fn sizes(&self) -> &SizeAlign {
-        &self.gen.sizes
+        &self.gen.gen.sizes
     }
 
-    fn is_list_canonical(&self, _iface: &Interface, element: &Type) -> bool {
+    fn is_list_canonical(&self, _resolve: &Resolve, element: &Type) -> bool {
         is_primitive(element)
     }
 }
@@ -2062,4 +2182,25 @@ fn is_primitive(ty: &Type) -> bool {
             | Type::Float32
             | Type::Float64
     )
+}
+
+trait ToJavaIdent: ToOwned {
+    fn to_java_ident(&self) -> Self::Owned;
+}
+
+impl ToJavaIdent for str {
+    fn to_java_ident(&self) -> String {
+        // Escape Java keywords
+        // Source: https://docs.oracle.com/javase/tutorial/java/nutsandbolts/_keywords.html
+        match self {
+            "abstract" | "continue" | "for" | "new" | "switch" | "assert" | "default" | "goto"
+            | "package" | "synchronized" | "boolean" | "do" | "if" | "private" | "this"
+            | "break" | "double" | "implements" | "protected" | "throw" | "byte" | "else"
+            | "import" | "public" | "throws" | "case" | "enum" | "instanceof" | "return"
+            | "transient" | "catch" | "extends" | "int" | "short" | "try" | "char" | "final"
+            | "interface" | "static" | "void" | "class" | "finally" | "long" | "strictfp"
+            | "volatile" | "const" | "float" | "native" | "super" | "while" => format!("{self}_"),
+            _ => self.to_lower_camel_case(),
+        }
+    }
 }

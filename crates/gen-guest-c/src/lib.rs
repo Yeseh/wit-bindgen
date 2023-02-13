@@ -22,6 +22,8 @@ struct C {
     names: Ns,
     needs_string: bool,
     world: String,
+    sizes: SizeAlign,
+    interface_names: HashMap<InterfaceId, String>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -43,9 +45,8 @@ impl Opts {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Return {
-    return_multiple: bool,
     scalar: Option<Scalar>,
     retptrs: Vec<Type>,
 }
@@ -62,24 +63,35 @@ struct CSig {
 enum Scalar {
     Void,
     OptionBool(Type),
-    ResultBool(bool),
+    ResultBool(Option<Type>, Option<Type>),
     Type(Type),
 }
 
 impl WorldGenerator for C {
-    fn preprocess(&mut self, name: &str) {
+    fn preprocess(&mut self, resolve: &Resolve, world: WorldId) {
+        let name = &resolve.worlds[world].name;
         self.world = name.to_string();
+        self.sizes.fill(resolve);
     }
 
-    fn import(&mut self, name: &str, iface: &Interface, _files: &mut Files) {
-        let mut gen = self.interface(name, iface, true);
-        gen.types();
+    fn import_interface(
+        &mut self,
+        resolve: &Resolve,
+        name: &str,
+        id: InterfaceId,
+        _files: &mut Files,
+    ) {
+        let prev = self.interface_names.insert(id, name.to_string());
+        assert!(prev.is_none());
+        let mut gen = self.interface(name, resolve, true);
+        gen.interface = Some(id);
+        gen.types(id);
 
-        for (i, func) in iface.functions.iter().enumerate() {
+        for (i, (_name, func)) in resolve.interfaces[id].functions.iter().enumerate() {
             if i == 0 {
                 uwriteln!(gen.src.h_fns, "\n// Imported Functions from `{name}`");
             }
-            gen.import(func);
+            gen.import(name, func);
         }
 
         gen.finish();
@@ -87,11 +99,41 @@ impl WorldGenerator for C {
         gen.gen.src.append(&gen.src);
     }
 
-    fn export(&mut self, name: &str, iface: &Interface, _files: &mut Files) {
-        let mut gen = self.interface(name, iface, false);
-        gen.types();
+    fn import_funcs(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        funcs: &[(&str, &Function)],
+        _files: &mut Files,
+    ) {
+        let name = &resolve.worlds[world].name;
+        let mut gen = self.interface(name, resolve, true);
 
-        for (i, func) in iface.functions.iter().enumerate() {
+        for (i, (_name, func)) in funcs.iter().enumerate() {
+            if i == 0 {
+                uwriteln!(gen.src.h_fns, "\n// Imported Functions from `{name}`");
+            }
+            gen.import("$root", func);
+        }
+
+        gen.finish();
+
+        gen.gen.src.append(&gen.src);
+    }
+
+    fn export_interface(
+        &mut self,
+        resolve: &Resolve,
+        name: &str,
+        id: InterfaceId,
+        _files: &mut Files,
+    ) {
+        self.interface_names.insert(id, name.to_string());
+        let mut gen = self.interface(name, resolve, false);
+        gen.interface = Some(id);
+        gen.types(id);
+
+        for (i, (_name, func)) in resolve.interfaces[id].functions.iter().enumerate() {
             if i == 0 {
                 uwriteln!(gen.src.h_fns, "\n// Exported Functions from `{name}`");
             }
@@ -103,11 +145,17 @@ impl WorldGenerator for C {
         gen.gen.src.append(&gen.src);
     }
 
-    fn export_default(&mut self, name: &str, iface: &Interface, _files: &mut Files) {
-        let mut gen = self.interface(name, iface, false);
-        gen.types();
+    fn export_funcs(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        funcs: &[(&str, &Function)],
+        _files: &mut Files,
+    ) {
+        let name = &resolve.worlds[world].name;
+        let mut gen = self.interface(name, resolve, false);
 
-        for (i, func) in iface.functions.iter().enumerate() {
+        for (i, (_name, func)) in funcs.iter().enumerate() {
             if i == 0 {
                 uwriteln!(gen.src.h_fns, "\n// Exported Functions from `{name}`");
             }
@@ -119,7 +167,24 @@ impl WorldGenerator for C {
         gen.gen.src.append(&gen.src);
     }
 
-    fn finish(&mut self, world: &World, files: &mut Files) {
+    fn export_types(
+        &mut self,
+        resolve: &Resolve,
+        world: WorldId,
+        types: &[(&str, TypeId)],
+        _files: &mut Files,
+    ) {
+        let name = &resolve.worlds[world].name;
+        let mut gen = self.interface(name, resolve, false);
+        for (name, id) in types {
+            gen.define_type(name, *id);
+        }
+        gen.finish();
+        gen.gen.src.append(&gen.src);
+    }
+
+    fn finish(&mut self, resolve: &Resolve, id: WorldId, files: &mut Files) {
+        let world = &resolve.worlds[id];
         let linking_symbol = component_type_object::linking_symbol(&world.name);
         self.include("<stdlib.h>");
         let snake = world.name.to_snake_case();
@@ -285,7 +350,7 @@ impl WorldGenerator for C {
         files.push(&format!("{snake}.h"), h_str.as_bytes());
         files.push(
             &format!("{snake}_component_type.o",),
-            component_type_object::object(world, self.opts.string_encoding)
+            component_type_object::object(resolve, id, self.opts.string_encoding)
                 .unwrap()
                 .as_slice(),
         );
@@ -296,17 +361,15 @@ impl C {
     fn interface<'a>(
         &'a mut self,
         name: &'a str,
-        iface: &'a Interface,
+        resolve: &'a Resolve,
         in_import: bool,
     ) -> InterfaceGenerator<'a> {
-        let mut sizes = SizeAlign::default();
-        sizes.fill(iface);
         InterfaceGenerator {
             name,
             src: Source::default(),
             gen: self,
-            iface,
-            sizes,
+            resolve,
+            interface: None,
             public_anonymous_types: Default::default(),
             private_anonymous_types: Default::default(),
             types: Default::default(),
@@ -332,8 +395,8 @@ struct InterfaceGenerator<'a> {
     src: Source,
     in_import: bool,
     gen: &'a mut C,
-    iface: &'a Interface,
-    sizes: SizeAlign,
+    resolve: &'a Resolve,
+    interface: Option<InterfaceId>,
 
     // The set of types that are considered public (aka need to be in the
     // header file) which are anonymous and we're effectively monomorphizing.
@@ -356,20 +419,21 @@ impl C {
         // Note that these intrinsics are declared as `weak` so they can be
         // overridden from some other symbol.
         self.src.c_fns(
-            "
-                __attribute__((weak, export_name(\"cabi_realloc\")))
-                void *cabi_realloc(void *ptr, size_t orig_size, size_t org_align, size_t new_size) {
+            r#"
+                __attribute__((weak, export_name("cabi_realloc")))
+                void *cabi_realloc(void *ptr, size_t old_size, size_t align, size_t new_size) {
+                    if (new_size == 0) return (void*) align;
                     void *ret = realloc(ptr, new_size);
                     if (!ret) abort();
                     return ret;
                 }
-            ",
+            "#,
         );
     }
 }
 
 impl Return {
-    fn return_single(&mut self, iface: &Interface, ty: &Type, orig_ty: &Type) {
+    fn return_single(&mut self, resolve: &Resolve, ty: &Type, orig_ty: &Type) {
         let id = match ty {
             Type::Id(id) => *id,
             Type::String => {
@@ -381,8 +445,8 @@ impl Return {
                 return;
             }
         };
-        match &iface.types[id].kind {
-            TypeDefKind::Type(t) => return self.return_single(iface, t, orig_ty),
+        match &resolve.types[id].kind {
+            TypeDefKind::Type(t) => return self.return_single(resolve, t, orig_ty),
 
             // Flags are returned as their bare values, and enums are scalars
             TypeDefKind::Flags(_) | TypeDefKind::Enum(_) => {
@@ -402,15 +466,13 @@ impl Return {
             // Unpack a result as a boolean return type, with two
             // return pointers for ok and err values
             TypeDefKind::Result(r) => {
-                let mut has_ok_type = false;
                 if let Some(ok) = r.ok {
-                    has_ok_type = true;
                     self.retptrs.push(ok);
                 }
                 if let Some(err) = r.err {
                     self.retptrs.push(err);
                 }
-                self.scalar = Some(Scalar::ResultBool(has_ok_type));
+                self.scalar = Some(Scalar::ResultBool(r.ok, r.err));
                 return;
             }
 
@@ -423,6 +485,7 @@ impl Return {
 
             TypeDefKind::Future(_) => todo!("return_single for future"),
             TypeDefKind::Stream(_) => todo!("return_single for stream"),
+            TypeDefKind::Unknown => unreachable!(),
         }
 
         self.retptrs.push(*orig_ty);
@@ -430,8 +493,8 @@ impl Return {
 }
 
 impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
-    fn iface(&self) -> &'a Interface {
-        self.iface
+    fn resolve(&self) -> &'a Resolve {
+        self.resolve
     }
 
     fn type_record(&mut self, id: TypeId, name: &str, record: &Record, docs: &Docs) {
@@ -442,7 +505,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         for field in record.fields.iter() {
             self.print_ty(SourceType::HDefs, &field.ty);
             self.src.h_defs(" ");
-            self.src.h_defs(&field.name.to_snake_case());
+            self.src.h_defs(&to_c_ident(&field.name));
             self.src.h_defs(";\n");
         }
         self.src.h_defs("} ");
@@ -508,7 +571,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             if let Some(ty) = self.get_nonempty_type(case.ty.as_ref()) {
                 self.print_ty(SourceType::HDefs, ty);
                 self.src.h_defs(" ");
-                self.src.h_defs(&case.name.to_snake_case());
+                self.src.h_defs(&to_c_ident(&case.name));
                 self.src.h_defs(";\n");
             }
         }
@@ -652,8 +715,8 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
 }
 
 impl InterfaceGenerator<'_> {
-    fn import(&mut self, func: &Function) {
-        let sig = self.iface.wasm_signature(AbiVariant::GuestImport, func);
+    fn import(&mut self, wasm_import_module: &str, func: &Function) {
+        let sig = self.resolve.wasm_signature(AbiVariant::GuestImport, func);
 
         self.src.c_fns("\n");
 
@@ -663,7 +726,7 @@ impl InterfaceGenerator<'_> {
         uwriteln!(
             self.src.c_fns,
             "__attribute__((import_module(\"{}\"), import_name(\"{}\")))",
-            self.name,
+            wasm_import_module,
             func.name
         );
         let import_name = self.gen.names.tmp(&format!(
@@ -703,7 +766,7 @@ impl InterfaceGenerator<'_> {
         for (i, (_, param)) in c_sig.params.iter().enumerate() {
             let ty = &func.params[i].1;
             if let Type::Id(id) = ty {
-                if let TypeDefKind::Option(option_ty) = &self.iface.types[*id].kind {
+                if let TypeDefKind::Option(option_ty) = &self.resolve.types[*id].kind {
                     let ty = self.type_string(ty);
                     uwrite!(
                         optional_adapters,
@@ -735,21 +798,35 @@ impl InterfaceGenerator<'_> {
             f.locals.insert(ptr).unwrap();
         }
         f.src.push_str(&optional_adapters);
-        f.gen.iface.call(
+        f.gen.resolve.call(
             AbiVariant::GuestImport,
             LiftLower::LowerArgsLiftResults,
             func,
             &mut f,
         );
 
-        let FunctionBindgen { src, .. } = f;
+        let FunctionBindgen {
+            src,
+            import_return_pointer_area_size,
+            import_return_pointer_area_align,
+            ..
+        } = f;
+
+        if import_return_pointer_area_size > 0 {
+            self.src.c_adapters(&format!(
+                "\
+                    __attribute__((aligned({import_return_pointer_area_align})))
+                    uint8_t ret_area[{import_return_pointer_area_size}];
+                ",
+            ));
+        }
 
         self.src.c_adapters(&String::from(src));
         self.src.c_adapters("}\n");
     }
 
     fn export(&mut self, func: &Function, interface_name: Option<&str>) {
-        let sig = self.iface.wasm_signature(AbiVariant::GuestExport, func);
+        let sig = self.resolve.wasm_signature(AbiVariant::GuestExport, func);
 
         let export_name = func.core_export_name(interface_name);
 
@@ -792,7 +869,7 @@ impl InterfaceGenerator<'_> {
         f.gen.src.c_adapters(") {\n");
 
         // Perform all lifting/lowering and append it to our src.
-        f.gen.iface.call(
+        f.gen.resolve.call(
             AbiVariant::GuestExport,
             LiftLower::LiftArgsLowerResults,
             func,
@@ -802,7 +879,7 @@ impl InterfaceGenerator<'_> {
         self.src.c_adapters(&src);
         self.src.c_adapters("}\n");
 
-        if self.iface.guest_export_needs_post_return(func) {
+        if self.resolve.guest_export_needs_post_return(func) {
             uwriteln!(
                 self.src.c_fns,
                 "__attribute__((weak, export_name(\"cabi_post_{export_name}\")))"
@@ -814,11 +891,7 @@ impl InterfaceGenerator<'_> {
                 name: String::from("INVALID"),
                 sig: String::from("INVALID"),
                 params: Vec::new(),
-                ret: Return {
-                    return_multiple: false,
-                    scalar: None,
-                    retptrs: Vec::new(),
-                },
+                ret: Return::default(),
                 retptrs: Vec::new(),
             };
             for (i, result) in sig.results.iter().enumerate() {
@@ -831,7 +904,7 @@ impl InterfaceGenerator<'_> {
 
             let mut f = FunctionBindgen::new(self, c_sig, &import_name);
             f.params = params;
-            f.gen.iface.post_return(func, &mut f);
+            f.gen.resolve.post_return(func, &mut f);
             let FunctionBindgen { src, .. } = f;
             self.src.c_fns(&src);
             self.src.c_fns("}\n");
@@ -869,7 +942,7 @@ impl InterfaceGenerator<'_> {
             }
         }
 
-        for id in self.iface.topological_types() {
+        for (id, _) in self.resolve.types.iter() {
             if let Some(ty) = self.types.get(&id) {
                 if private_types.contains(&id) {
                     // It's private; print it in the .c file.
@@ -899,9 +972,9 @@ impl InterfaceGenerator<'_> {
         match &ret.scalar {
             None | Some(Scalar::Void) => self.src.h_fns("void"),
             Some(Scalar::OptionBool(_id)) => self.src.h_fns("bool"),
-            Some(Scalar::ResultBool(has_ok_type)) => {
+            Some(Scalar::ResultBool(ok, _err)) => {
                 result_rets = true;
-                result_rets_has_ok_type = *has_ok_type;
+                result_rets_has_ok_type = ok.is_some();
                 self.src.h_fns("bool");
             }
             Some(Scalar::Type(ty)) => self.print_ty(SourceType::HFns, ty),
@@ -917,7 +990,7 @@ impl InterfaceGenerator<'_> {
             let pointer = self.is_arg_by_pointer(ty);
             // optional param pointer flattening
             let optional_type = if let Type::Id(id) = ty {
-                if let TypeDefKind::Option(option_ty) = &self.iface.types[*id].kind {
+                if let TypeDefKind::Option(option_ty) = &self.resolve.types[*id].kind {
                     Some(option_ty)
                 } else {
                     None
@@ -926,9 +999,9 @@ impl InterfaceGenerator<'_> {
                 None
             };
             let (print_ty, print_name) = if let Some(option_ty) = optional_type {
-                (option_ty, format!("maybe_{}", name.to_snake_case()))
+                (option_ty, format!("maybe_{}", to_c_ident(name)))
             } else {
-                (ty, name.to_snake_case())
+                (ty, to_c_ident(name))
             };
             self.print_ty(SourceType::HFns, print_ty);
             self.src.h_fns(" ");
@@ -936,7 +1009,7 @@ impl InterfaceGenerator<'_> {
                 self.src.h_fns("*");
             }
             self.src.h_fns(&print_name);
-            params.push((optional_type.is_none() && pointer, name.to_snake_case()));
+            params.push((optional_type.is_none() && pointer, to_c_ident(name)));
         }
         let mut retptrs = Vec::new();
         let single_ret = ret.retptrs.len() == 1;
@@ -979,19 +1052,14 @@ impl InterfaceGenerator<'_> {
     }
 
     fn classify_ret(&mut self, func: &Function) -> Return {
-        let mut ret = Return {
-            return_multiple: false,
-            scalar: None,
-            retptrs: Vec::new(),
-        };
+        let mut ret = Return::default();
         match func.results.len() {
             0 => ret.scalar = Some(Scalar::Void),
             1 => {
                 let ty = func.results.iter_types().next().unwrap();
-                ret.return_single(self.iface, ty, ty);
+                ret.return_single(self.resolve, ty, ty);
             }
             _ => {
-                ret.return_multiple = true;
                 ret.retptrs.extend(func.results.iter_types().cloned());
             }
         }
@@ -1000,7 +1068,7 @@ impl InterfaceGenerator<'_> {
 
     fn is_arg_by_pointer(&self, ty: &Type) -> bool {
         match ty {
-            Type::Id(id) => match &self.iface.types[*id].kind {
+            Type::Id(id) => match &self.resolve.types[*id].kind {
                 TypeDefKind::Type(t) => self.is_arg_by_pointer(t),
                 TypeDefKind::Variant(_) => true,
                 TypeDefKind::Union(_) => true,
@@ -1011,6 +1079,7 @@ impl InterfaceGenerator<'_> {
                 TypeDefKind::Tuple(_) | TypeDefKind::Record(_) | TypeDefKind::List(_) => true,
                 TypeDefKind::Future(_) => todo!("is_arg_by_pointer for future"),
                 TypeDefKind::Stream(_) => todo!("is_arg_by_pointer for stream"),
+                TypeDefKind::Unknown => unreachable!(),
             },
             Type::String => true,
             _ => false,
@@ -1055,10 +1124,25 @@ impl InterfaceGenerator<'_> {
                 self.gen.needs_string = true;
             }
             Type::Id(id) => {
-                let ty = &self.iface.types[*id];
+                let ty = &self.resolve.types[*id];
                 match &ty.name {
                     Some(name) => {
-                        self.print_namespace(stype);
+                        match ty.owner {
+                            TypeOwner::Interface(owner) => {
+                                self.src.print(
+                                    stype,
+                                    &self.gen.interface_names[&owner].to_snake_case(),
+                                );
+                                self.src.print(stype, "_");
+                            }
+                            TypeOwner::World(owner) => {
+                                self.src
+                                    .print(stype, &self.resolve.worlds[owner].name.to_snake_case());
+                                self.src.print(stype, "_");
+                            }
+                            TypeOwner::None => {}
+                        }
+
                         self.src.print(stype, &name.to_snake_case());
                         self.src.print(stype, "_t");
                     }
@@ -1093,7 +1177,7 @@ impl InterfaceGenerator<'_> {
             Type::Float64 => self.src.print(stype, "float64"),
             Type::String => self.src.print(stype, "string"),
             Type::Id(id) => {
-                let ty = &self.iface.types[*id];
+                let ty = &self.resolve.types[*id];
                 if let Some(name) = &ty.name {
                     return self.src.print(stype, &name.to_snake_case());
                 }
@@ -1138,6 +1222,7 @@ impl InterfaceGenerator<'_> {
                         self.src.print(stype, "_");
                         self.print_optional_ty_name(stype, s.end.as_ref());
                     }
+                    TypeDefKind::Unknown => unreachable!(),
                 }
             }
         }
@@ -1167,7 +1252,7 @@ impl InterfaceGenerator<'_> {
             Type::Id(id) => *id,
             _ => return false,
         };
-        match &self.iface.types[id].kind {
+        match &self.resolve.types[id].kind {
             TypeDefKind::Type(t) => self.is_empty_type(t),
             TypeDefKind::Record(r) => r.fields.is_empty(),
             TypeDefKind::Tuple(t) => t.types.is_empty(),
@@ -1224,7 +1309,7 @@ impl InterfaceGenerator<'_> {
     fn print_anonymous_type(&mut self, ty: TypeId) {
         let prev = mem::take(&mut self.src.h_defs);
         self.src.h_defs("\ntypedef ");
-        let kind = &self.iface.types[ty].kind;
+        let kind = &self.resolve.types[ty].kind;
         match kind {
             TypeDefKind::Type(_)
             | TypeDefKind::Flags(_)
@@ -1278,6 +1363,7 @@ impl InterfaceGenerator<'_> {
             }
             TypeDefKind::Future(_) => todo!("print_anonymous_type for future"),
             TypeDefKind::Stream(_) => todo!("print_anonymous_type for stream"),
+            TypeDefKind::Unknown => unreachable!(),
         }
         self.src.h_defs(" ");
         self.print_namespace(SourceType::HDefs);
@@ -1304,7 +1390,7 @@ impl InterfaceGenerator<'_> {
         self.src.c_helpers(&self.src.h_helpers[pos..].to_string());
         self.src.h_helpers(";");
         self.src.c_helpers(" {\n");
-        match &self.iface.types[id].kind {
+        match &self.resolve.types[id].kind {
             TypeDefKind::Type(t) => self.free(t, "ptr"),
 
             TypeDefKind::Flags(_) => {}
@@ -1315,7 +1401,7 @@ impl InterfaceGenerator<'_> {
                     if !self.owns_anything(&field.ty) {
                         continue;
                     }
-                    self.free(&field.ty, &format!("&ptr->{}", field.name.to_snake_case()));
+                    self.free(&field.ty, &format!("&ptr->{}", to_c_ident(&field.name)));
                 }
             }
 
@@ -1348,7 +1434,7 @@ impl InterfaceGenerator<'_> {
                             continue;
                         }
                         uwriteln!(self.src.c_helpers, "case {}: {{", i);
-                        let expr = format!("&ptr->val.{}", case.name.to_snake_case());
+                        let expr = format!("&ptr->val.{}", to_c_ident(&case.name));
                         if let Some(ty) = &case.ty {
                             self.free(ty, &expr);
                         }
@@ -1397,6 +1483,7 @@ impl InterfaceGenerator<'_> {
             }
             TypeDefKind::Future(_) => todo!("print_dtor for future"),
             TypeDefKind::Stream(_) => todo!("print_dtor for stream"),
+            TypeDefKind::Unknown => unreachable!(),
         }
         self.src.c_helpers("}\n");
     }
@@ -1407,7 +1494,7 @@ impl InterfaceGenerator<'_> {
             Type::String => return true,
             _ => return false,
         };
-        match &self.iface.types[id].kind {
+        match &self.resolve.types[id].kind {
             TypeDefKind::Type(t) => self.owns_anything(t),
             TypeDefKind::Record(r) => r.fields.iter().any(|t| self.owns_anything(&t.ty)),
             TypeDefKind::Tuple(t) => t.types.iter().any(|t| self.owns_anything(t)),
@@ -1426,6 +1513,7 @@ impl InterfaceGenerator<'_> {
             }
             TypeDefKind::Future(_) => todo!("owns_anything for future"),
             TypeDefKind::Stream(_) => todo!("owns_anything for stream"),
+            TypeDefKind::Unknown => unreachable!(),
         }
     }
 
@@ -1469,6 +1557,8 @@ struct FunctionBindgen<'a, 'b> {
     params: Vec<String>,
     wasm_return: Option<String>,
     ret_store_cnt: usize,
+    import_return_pointer_area_size: usize,
+    import_return_pointer_area_align: usize,
 }
 
 impl<'a, 'b> FunctionBindgen<'a, 'b> {
@@ -1489,6 +1579,8 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             params: Vec::new(),
             wasm_return: None,
             ret_store_cnt: 0,
+            import_return_pointer_area_size: 0,
+            import_return_pointer_area_align: 0,
         }
     }
 
@@ -1527,17 +1619,13 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
         );
         self.ret_store_cnt = self.ret_store_cnt + 1;
     }
-
-    fn check_all_retptrs_written(&self) {
-        assert!(self.ret_store_cnt == self.sig.retptrs.len());
-    }
 }
 
 impl Bindgen for FunctionBindgen<'_, '_> {
     type Operand = String;
 
     fn sizes(&self) -> &SizeAlign {
-        &self.gen.sizes
+        &self.gen.gen.sizes
     }
 
     fn push_block(&mut self) {
@@ -1551,22 +1639,15 @@ impl Bindgen for FunctionBindgen<'_, '_> {
         self.blocks.push((src.into(), mem::take(operands)));
     }
 
-    fn return_pointer(&mut self, _iface: &Interface, size: usize, align: usize) -> String {
+    fn return_pointer(&mut self, size: usize, align: usize) -> String {
         let ptr = self.locals.tmp("ptr");
 
+        // Use a stack-based return area for imports, because exports need
+        // their return area to be live until the post-return call.
         if self.gen.in_import {
-            // Declare a stack-allocated return area. We only do this for
-            // imports, because exports need their return area to be live until
-            // the post-return call.
-            uwrite!(
-                self.src,
-                "\
-                    __attribute__((aligned({})))
-                    uint8_t ret_area[{}];
-                ",
-                align,
-                size,
-            );
+            self.import_return_pointer_area_size = self.import_return_pointer_area_size.max(size);
+            self.import_return_pointer_area_align =
+                self.import_return_pointer_area_align.max(align);
             uwriteln!(self.src, "int32_t {} = (int32_t) &ret_area;", ptr);
         } else {
             self.gen.gen.return_pointer_area_size = self.gen.gen.return_pointer_area_size.max(size);
@@ -1579,13 +1660,13 @@ impl Bindgen for FunctionBindgen<'_, '_> {
         ptr
     }
 
-    fn is_list_canonical(&self, iface: &Interface, ty: &Type) -> bool {
-        iface.all_bits_valid(ty)
+    fn is_list_canonical(&self, resolve: &Resolve, ty: &Type) -> bool {
+        resolve.all_bits_valid(ty)
     }
 
     fn emit(
         &mut self,
-        _iface: &Interface,
+        _resolve: &Resolve,
         inst: &Instruction<'_>,
         operands: &mut Vec<String>,
         results: &mut Vec<String>,
@@ -1679,7 +1760,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             Instruction::RecordLower { record, .. } => {
                 let op = &operands[0];
                 for f in record.fields.iter() {
-                    results.push(format!("({}).{}", op, f.name.to_snake_case()));
+                    results.push(format!("({}).{}", op, to_c_ident(&f.name)));
                 }
             }
             Instruction::RecordLift { ty, .. } => {
@@ -1782,7 +1863,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                             operands[0],
                         );
                         self.src.push_str(".");
-                        self.src.push_str(&case.name.to_snake_case());
+                        self.src.push_str(&to_c_ident(&case.name));
                         self.src.push_str(";\n");
                     }
                     self.src.push_str(&block);
@@ -1816,7 +1897,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     if let Some(_) = self.gen.get_nonempty_type(case.ty.as_ref()) {
                         let mut dst = format!("{}.val", result);
                         dst.push_str(".");
-                        dst.push_str(&case.name.to_snake_case());
+                        dst.push_str(&to_c_ident(&case.name));
                         self.store_op(&block_results[0], &dst);
                     }
                     self.src.push_str("break;\n}\n");
@@ -2161,7 +2242,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                         if !self.gen.in_import {
                             if let Type::Id(id) = ty {
                                 if let TypeDefKind::Option(option_ty) =
-                                    &self.gen.iface.types[*id].kind
+                                    &self.gen.resolve.types[*id].kind
                                 {
                                     if self.gen.is_empty_type(option_ty) {
                                         uwrite!(args, "{op}.is_some ? (void*)1 : NULL");
@@ -2218,28 +2299,41 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                             .gen
                             .type_string(func.results.iter_types().next().unwrap());
                         let option_ret = self.locals.tmp("ret");
-                        uwrite!(
-                            self.src,
-                            "
-                                {ty} {ret};
-                                {ret}.is_some = {tag};
-                                {ret}.val = {val};
-                            ",
-                            ty = option_ty,
-                            ret = option_ret,
-                            tag = ret,
-                            val = val,
-                        );
+                        if !self.gen.is_empty_type(ty) {
+                            uwrite!(
+                                self.src,
+                                "
+                                    {ty} {ret};
+                                    {ret}.is_some = {tag};
+                                    {ret}.val = {val};
+                                ",
+                                ty = option_ty,
+                                ret = option_ret,
+                                tag = ret,
+                                val = val,
+                            );
+                        } else {
+                            uwrite!(
+                                self.src,
+                                "
+                                    {ty} {ret};
+                                    {ret}.is_some = {tag};
+                                ",
+                                ty = option_ty,
+                                ret = option_ret,
+                                tag = ret,
+                            );
+                        }
                         results.push(option_ret);
                     }
-                    Some(Scalar::ResultBool(has_ok_type)) => {
+                    Some(Scalar::ResultBool(ok, err)) => {
                         let result_ty = self
                             .gen
                             .type_string(func.results.iter_types().next().unwrap());
                         let ret = self.locals.tmp("ret");
                         let mut ret_iter = self.sig.ret.retptrs.iter();
                         uwriteln!(self.src, "{result_ty} {ret};");
-                        let ok_name = if *has_ok_type {
+                        let ok_name = if ok.is_some() {
                             if let Some(ty) = ret_iter.next() {
                                 let val = self.locals.tmp("ok");
                                 if args.len() > 0 {
@@ -2270,82 +2364,88 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                         assert!(ret_iter.next().is_none());
                         uwrite!(self.src, "");
                         uwriteln!(self.src, "{ret}.is_err = !{}({args});", self.sig.name);
-
-                        if let Some(err_name) = err_name {
-                            uwriteln!(
-                                self.src,
-                                "if ({ret}.is_err) {{
-                                    {ret}.val.err = {err_name};
-                                }}",
-                            );
+                        if self.gen.get_nonempty_type(err.as_ref()).is_some() {
+                            if let Some(err_name) = err_name {
+                                uwriteln!(
+                                    self.src,
+                                    "if ({ret}.is_err) {{
+                                        {ret}.val.err = {err_name};
+                                    }}",
+                                );
+                            }
                         }
-                        if let Some(ok_name) = ok_name {
-                            uwriteln!(
-                                self.src,
-                                "if (!{ret}.is_err) {{
-                                    {ret}.val.ok = {ok_name};
-                                }}"
-                            );
-                        } else {
-                            uwrite!(self.src, "\n");
+                        if self.gen.get_nonempty_type(ok.as_ref()).is_some() {
+                            if let Some(ok_name) = ok_name {
+                                uwriteln!(
+                                    self.src,
+                                    "if (!{ret}.is_err) {{
+                                        {ret}.val.ok = {ok_name};
+                                    }}"
+                                );
+                            } else {
+                                uwrite!(self.src, "\n");
+                            }
                         }
                         results.push(ret);
                     }
                 }
             }
-            Instruction::Return { .. } if self.gen.in_import => {
-                match self.sig.ret.scalar {
-                    None => {
-                        for op in operands.iter() {
-                            self.store_in_retptr(op);
-                        }
-                    }
-                    Some(Scalar::Void) => {
-                        assert!(operands.is_empty());
-                    }
-                    Some(Scalar::Type(_)) => {
-                        assert_eq!(operands.len(), 1);
-                        self.src.push_str("return ");
-                        self.src.push_str(&operands[0]);
-                        self.src.push_str(";\n");
-                    }
-                    Some(Scalar::OptionBool(_)) => {
-                        assert_eq!(operands.len(), 1);
-                        let variant = &operands[0];
-                        self.store_in_retptr(&format!("{}.val", variant));
-                        self.src.push_str("return ");
-                        self.src.push_str(&variant);
-                        self.src.push_str(".is_some;\n");
-                    }
-                    Some(Scalar::ResultBool(has_ok_type)) => {
-                        assert_eq!(operands.len(), 1);
-                        let variant = &operands[0];
-                        assert!(self.sig.retptrs.len() <= 2);
-                        uwriteln!(self.src, "if (!{}.is_err) {{", variant);
-                        if self.sig.retptrs.len() == 2 {
-                            self.store_in_retptr(&format!("{}.val.ok", variant));
-                        } else if self.sig.retptrs.len() == 1 && has_ok_type {
-                            self.store_in_retptr(&format!("{}.val.ok", variant));
-                        }
-                        uwriteln!(
-                            self.src,
-                            "   return 1;
-                            }} else {{"
-                        );
-                        if self.sig.retptrs.len() == 2 {
-                            self.store_in_retptr(&format!("{}.val.err", variant));
-                        } else if self.sig.retptrs.len() == 1 && !has_ok_type {
-                            self.store_in_retptr(&format!("{}.val.err", variant));
-                        }
-                        uwriteln!(
-                            self.src,
-                            "   return 0;
-                            }}"
-                        );
+            Instruction::Return { .. } if self.gen.in_import => match self.sig.ret.scalar {
+                None => {
+                    for op in operands.iter() {
+                        self.store_in_retptr(op);
                     }
                 }
-                self.check_all_retptrs_written();
-            }
+                Some(Scalar::Void) => {
+                    assert!(operands.is_empty());
+                }
+                Some(Scalar::Type(_)) => {
+                    assert_eq!(operands.len(), 1);
+                    self.src.push_str("return ");
+                    self.src.push_str(&operands[0]);
+                    self.src.push_str(";\n");
+                }
+                Some(Scalar::OptionBool(o)) => {
+                    assert_eq!(operands.len(), 1);
+                    let variant = &operands[0];
+                    if !self.gen.is_empty_type(&o) {
+                        self.store_in_retptr(&format!("{}.val", variant));
+                    }
+                    self.src.push_str("return ");
+                    self.src.push_str(&variant);
+                    self.src.push_str(".is_some;\n");
+                }
+                Some(Scalar::ResultBool(ok, err)) => {
+                    assert_eq!(operands.len(), 1);
+                    let variant = &operands[0];
+                    assert!(self.sig.retptrs.len() <= 2);
+                    uwriteln!(self.src, "if (!{}.is_err) {{", variant);
+                    if let Some(_) = self.gen.get_nonempty_type(ok.as_ref()) {
+                        if self.sig.retptrs.len() == 2 {
+                            self.store_in_retptr(&format!("{}.val.ok", variant));
+                        } else if self.sig.retptrs.len() == 1 && ok.is_some() {
+                            self.store_in_retptr(&format!("{}.val.ok", variant));
+                        }
+                    }
+                    uwriteln!(
+                        self.src,
+                        "   return 1;
+                            }} else {{"
+                    );
+                    if let Some(_) = self.gen.get_nonempty_type(err.as_ref()) {
+                        if self.sig.retptrs.len() == 2 {
+                            self.store_in_retptr(&format!("{}.val.err", variant));
+                        } else if self.sig.retptrs.len() == 1 && !ok.is_some() {
+                            self.store_in_retptr(&format!("{}.val.err", variant));
+                        }
+                    }
+                    uwriteln!(
+                        self.src,
+                        "   return 0;
+                            }}"
+                    );
+                }
+            },
             Instruction::Return { amt, .. } => {
                 assert!(*amt <= 1);
                 if *amt == 1 {
@@ -2409,7 +2509,7 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 uwriteln!(self.src, "int32_t {len} = {};", operands[1]);
                 let i = self.locals.tmp("i");
                 uwriteln!(self.src, "for (int32_t {i} = 0; {i} < {len}; {i}++) {{");
-                let size = self.gen.sizes.size(element);
+                let size = self.gen.gen.sizes.size(element);
                 uwriteln!(self.src, "int32_t base = {ptr} + {i} * {size};");
                 uwriteln!(self.src, "(void) base;");
                 uwrite!(self.src, "{body}");
@@ -2516,5 +2616,46 @@ fn flags_repr(f: &Flags) -> Int {
         FlagsRepr::U32(1) => Int::U32,
         FlagsRepr::U32(2) => Int::U64,
         repr => panic!("unimplemented flags {:?}", repr),
+    }
+}
+
+pub fn to_c_ident(name: &str) -> String {
+    match name {
+        // Escape C keywords.
+        // Source: https://en.cppreference.com/w/c/keyword
+        "auto" => "auto_".into(),
+        "else" => "else_".into(),
+        "long" => "long_".into(),
+        "switch" => "switch_".into(),
+        "break" => "break_".into(),
+        "enum" => "enum_".into(),
+        "register" => "register_".into(),
+        "typedef" => "typedef_".into(),
+        "case" => "case_".into(),
+        "extern" => "extern_".into(),
+        "return" => "return_".into(),
+        "union" => "union_".into(),
+        "char" => "char_".into(),
+        "float" => "float_".into(),
+        "short" => "short_".into(),
+        "unsigned" => "unsigned_".into(),
+        "const" => "const_".into(),
+        "for" => "for_".into(),
+        "signed" => "signed_".into(),
+        "void" => "void_".into(),
+        "continue" => "continue_".into(),
+        "goto" => "goto_".into(),
+        "sizeof" => "sizeof_".into(),
+        "volatile" => "volatile_".into(),
+        "default" => "default_".into(),
+        "if" => "if_".into(),
+        "static" => "static_".into(),
+        "while" => "while_".into(),
+        "do" => "do_".into(),
+        "int" => "int_".into(),
+        "struct" => "struct_".into(),
+        "_Packed" => "_Packed_".into(),
+        "double" => "double_".into(),
+        s => s.to_snake_case(),
     }
 }
