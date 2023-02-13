@@ -1,0 +1,13 @@
+interface host-funcs {
+  test: func() 
+}
+
+default world task-world {
+  export task: interface {
+    dispose: func() -> s32
+    init: func() -> s32
+    run: func() -> s32
+  }
+
+  import host: self.host-funcs 
+}

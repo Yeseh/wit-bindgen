@@ -50,16 +50,17 @@ wit-bindgen-gen-guest-rust = { workspace = true, features = ['clap'], optional =
 wit-bindgen-gen-guest-c = { workspace = true, features = ['clap'], optional = true }
 wit-bindgen-gen-markdown = { workspace = true, features = ['clap'], optional = true }
 wit-bindgen-gen-guest-teavm-java = { workspace = true, features = ['clap'], optional = true }
-wit-bindgen-gen-guest-csharp = { path = 'crates/gen-guest-csharp', features = ['clap'] }
+wit-bindgen-gen-guest-csharp = { workspace = true, features = ['clap'], optional = true }
 wat = { workspace = true }
 wit-component = { workspace = true }
 
 [features]
-default = ['c', 'rust', 'markdown', 'teavm-java']
+default = ['c', 'rust', 'markdown', 'teavm-java', 'csharp']
 c = ['dep:wit-bindgen-gen-guest-c']
 rust = ['dep:wit-bindgen-gen-guest-rust']
 markdown = ['dep:wit-bindgen-gen-markdown']
 teavm-java = ['dep:wit-bindgen-gen-guest-teavm-java']
+csharp = ['dep:wit-bindgen-gen-guest-csharp']
 
 [dev-dependencies]
 heck = { workspace = true }

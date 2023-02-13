@@ -3,8 +3,6 @@ name = "wit-bindgen-gen-guest-csharp"
 version.workspace = true
 edition.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 wit-bindgen-core = { workspace = true }
 wit-component = { workspace = true }

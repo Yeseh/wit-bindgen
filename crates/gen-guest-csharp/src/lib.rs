@@ -16,10 +16,17 @@ use wit_bindgen_core::{
     Files, InterfaceGenerator as _, Ns, WorldGenerator,
 };
 
+const USINGS: &str = "\
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+\
+";
+
 #[derive(Default, Debug, Clone)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct Opts {
-    generate_stub: bool,
+    // generate_stub: bool,
 }
 
 struct InterfaceFragment {
@@ -61,6 +68,7 @@ impl CSharp {
         InterfaceGenerator {
             src: String::new(),
             stub: String::new(),
+            csrc: String::new(),
             gen: self,
             resolve,
             name,
@@ -173,6 +181,8 @@ impl WorldGenerator for CSharp {
             src,
             "namespace {namespace};
 
+            {USINGS}
+
             public sealed class {name}World 
             {{
                 private {name}World() {{}}
@@ -208,6 +218,8 @@ impl WorldGenerator for CSharp {
 
             let body = format!(
                 "namespace {namespace}
+
+                {USINGS}
 
                 public sealed class {name} {{
                     private {name}() {{}}
@@ -420,7 +432,7 @@ impl InterfaceGenerator<'_> {
         }
 
         // TODO: check stub stuff
-        if self.gen.opts.generate_stub {}
+        // if self.gen.opts.generate_stub {}
     }
 
     fn type_name(&mut self, ty: &Type) -> String {
@@ -975,20 +987,75 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             Instruction::FlagsLower { flags, name, ty } => todo!(),
             Instruction::FlagsLift { flags, name, ty } => todo!(),
 
-            Instruction::RecordLower { record, name, ty } => todo!(),
-            Instruction::RecordLift { record, name, ty } => todo!(),
+            Instruction::RecordLower { record, name, ty } => {
+                let op = &operands[0];
+                for field in record.fields.iter() {
+                    results.push(format!("({op}).{}", field.name.to_csharp_ident()));
+                }
+            }
+            Instruction::RecordLift { record, name, ty } => {
+                let ops = operands
+                    .iter()
+                    .map(|op| op.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
 
-            Instruction::EnumLower { enum_, name, ty } => results.push(format!(
+            Instruction::EnumLower { name, .. } => results.push(format!(
                 "Array.IndexOf(Enum.GetValues(typeof({})), {})",
                 name.to_upper_camel_case(),
                 operands[0]
             )),
-            Instruction::EnumLift { enum_, name, ty } => results.push(format!(
+            Instruction::EnumLift { name, .. } => results.push(format!(
                 "Enum.GetNames(typeof({})).GetValue({})",
                 name.to_upper_camel_case(),
                 operands[0]
             )),
 
+            Instruction::StringLower { realloc } => {
+                let op = &operands[0];
+                let bytes = self.locals.tmp("bytes");
+                uwriteln!(
+                    self.src,
+                    "byte[] {bytes} = System.Encoding.UTF8.GetBytes({op});"
+                );
+
+                // TODO: Realloc
+                if realloc.is_none() {
+                } else {
+                    let address = self.locals.tmp("address");
+                    uwrite!(
+                        self.src,
+                        "
+                        var {address} = (IntPtr)GCHandle.Alloc({bytes});
+                        "
+                    );
+                    results.push(format!("(int){address}"))
+                }
+                results.push(format!("{bytes}.Length"));
+            }
+            Instruction::StringLift => {
+                let bytes = self.locals.tmp("bytes");
+                let address = &operands[0];
+                let length = &operands[1];
+
+                uwrite!(
+                    self.src,
+                    "
+                    var {bytes} = new ReadonlySpan({address}, {length});
+                    "
+                );
+
+                results.push(format!("Encoding.UTF8.GetString({bytes})"))
+            }
+
+            Instruction::IterElem { .. } => {
+                results.push(self.block_storage.last().unwrap().element.clone())
+            }
+
+            Instruction::IterBasePointer => {
+                results.push(self.block_storage.last().unwrap().base.clone())
+            }
             Instruction::I32Load { offset } => todo!(),
             Instruction::I32Load8U { offset } => todo!(),
             Instruction::I32Load8S { offset } => todo!(),
@@ -1004,13 +1071,9 @@ impl Bindgen for FunctionBindgen<'_, '_> {
             Instruction::F32Store { offset } => todo!(),
             Instruction::F64Store { offset } => todo!(),
             Instruction::ListCanonLower { element, realloc } => todo!(),
-            Instruction::StringLower { realloc } => todo!(),
             Instruction::ListLower { element, realloc } => todo!(),
             Instruction::ListCanonLift { element, ty } => todo!(),
-            Instruction::StringLift => todo!(),
             Instruction::ListLift { element, ty } => todo!(),
-            Instruction::IterElem { element } => todo!(),
-            Instruction::IterBasePointer => todo!(),
             Instruction::TupleLower { tuple, ty } => todo!(),
             Instruction::TupleLift { tuple, ty } => todo!(),
             Instruction::VariantPayloadName => todo!(),
@@ -1034,45 +1097,208 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 results,
             } => todo!(),
             Instruction::OptionLift { payload, ty } => todo!(),
+
             Instruction::ResultLower {
+                results: lowered_types,
                 result,
-                ty,
+                ..
+            } => self.lower_variant(
+                &[("ok", result.ok), ("err", result.err)],
+                lowered_types,
+                &operands[0],
                 results,
-            } => todo!(),
-            Instruction::ResultLift { result, ty } => todo!(),
-            Instruction::CallWasm { name, sig } => todo!(),
-            Instruction::CallInterface { func } => todo!(),
-            Instruction::Return { amt, func } => todo!(),
+            ),
+
+            Instruction::ResultLift { result, ty } => self.lift_variant(
+                &Type::Id(*ty),
+                &[("ok", result.ok), ("err", result.err)],
+                &operands[0],
+                results,
+            ),
+
+            Instruction::CallWasm { name, sig } => {
+                let assignment = match &sig.results[..] {
+                    [result] => {
+                        let ty = wasm_type(*result);
+                        let result = self.locals.tmp("result");
+                        let assignment = format!("{ty} {result} = ");
+                        results.push(result);
+                        assignment
+                    }
+                    [] => String::new(),
+                    _ => unreachable!(),
+                };
+
+                let func_name = self.func_name.to_upper_camel_case();
+                let operands = operands.join(", ");
+                uwriteln!(self.src, "{assignment} wasmImport{func_name}({operands});")
+            }
+            Instruction::CallInterface { func } => {
+                let (assignment, destructure) = match func.results.len() {
+                    0 => (String::new(), String::new()),
+                    1 => {
+                        let ty = self
+                            .gen
+                            .type_name(func.results.iter_types().next().unwrap());
+                        let result = self.locals.tmp("result");
+                        let assignment = format!("{ty} {result} = ");
+                        results.push(result);
+                        (assignment, String::new())
+                    }
+                    count => {
+                        self.gen.gen.tuple_counts.insert(count);
+                        let ty = format!(
+                            "{}Tuple{count}<{}>",
+                            self.gen.gen.qualifier(),
+                            func.results
+                                .iter_types()
+                                .map(|ty| self.gen.type_name(ty))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+
+                        let result = self.locals.tmp("result");
+                        let assignment = format!("{ty} {result} = ");
+
+                        let destructure = func
+                            .results
+                            .iter_types()
+                            .enumerate()
+                            .map(|(index, ty)| {
+                                let ty = self.gen.type_name(ty);
+                                let my_result = self.locals.tmp("result");
+                                let assignment = format!("{ty} {my_result} = {result}.f{index};");
+                                results.push(my_result);
+                                assignment
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        (assignment, destructure)
+                    }
+                };
+
+                let module = self.gen.name.to_upper_camel_case();
+                let name = func.name.to_csharp_ident();
+
+                let args = operands.join(", ");
+
+                uwrite!(
+                    self.src,
+                    "
+                    {assignment}{module}Impl.{name}({args});
+                    {destructure}
+                    "
+                );
+            }
+            Instruction::Return { amt, .. } => {
+                for Cleanup {
+                    address,
+                    size,
+                    align,
+                } in &self.cleanup
+                {
+                    uwriteln!(self.src, "GCHandle.FromIntPtr({address}).Free();");
+                }
+
+                if self.needs_cleanup_list {
+                    uwrite!(
+                        self.src,
+                        "
+                        for ({}Cleanup cleanup in cleanupList) {{
+                            GCHandle.FromIntPtr(cleanup.address).Free();
+                        }}
+                        ",
+                        self.gen.gen.qualifier()
+                    );
+                }
+
+                match *amt {
+                    0 => (),
+                    1 => uwriteln!(self.src, "return {};", operands[0]),
+                    count => {
+                        let results = operands.join(", ");
+                        uwriteln!(
+                            self.src,
+                            "return new {}Tuple{count}<>({results});",
+                            self.gen.gen.qualifier()
+                        )
+                    }
+                }
+            }
             Instruction::Malloc {
                 realloc,
                 size,
                 align,
             } => todo!(),
-            Instruction::GuestDeallocate { size, align } => todo!(),
-            Instruction::GuestDeallocateString => todo!(),
+            Instruction::GuestDeallocate { size, align } => {
+                uwriteln!(self.src, "GCHandle.FromIntPtr({});", operands[0])
+            }
+            Instruction::GuestDeallocateString => {
+                uwriteln!(self.src, "GCHandle.FromIntPtr({});", operands[0])
+            }
             Instruction::GuestDeallocateList { element } => todo!(),
             Instruction::GuestDeallocateVariant { blocks } => todo!(),
         }
     }
 
-    fn return_pointer(&mut self, iface: &Interface, size: usize, align: usize) -> Self::Operand {
-        todo!()
+    fn return_pointer(&mut self, size: usize, align: usize) -> String {
+        self.gen.gen.return_area_size = self.gen.gen.return_area_size.max(size);
+        self.gen.gen.return_area_align = self.gen.gen.return_area_align.max(align);
+        format!("{}RETURN_AREA", self.gen.gen.qualifier())
     }
 
     fn push_block(&mut self) {
-        todo!()
+        self.block_storage.push(BlockStorage {
+            body: mem::take(&mut self.src),
+            element: self.locals.tmp("element"),
+            base: self.locals.tmp("base"),
+            cleanup: mem::take(&mut self.cleanup),
+        });
     }
 
-    fn finish_block(&mut self, operand: &mut Vec<Self::Operand>) {
+    fn finish_block(&mut self, operands: &mut Vec<Self::Operand>) {
+        let BlockStorage {
+            body,
+            element,
+            base,
+            cleanup,
+        } = self.block_storage.pop().unwrap();
+
+        if !self.cleanup.is_empty() {
+            self.needs_cleanup_list = true;
+
+            for Cleanup {
+                address,
+                size,
+                align,
+            } in &self.cleanup
+            {
+                uwriteln!(
+                    self.src,
+                    "cleanupList.add(new {}Cleanup({address}, {size}, {align}));",
+                    self.gen.gen.qualifier()
+                );
+            }
+        }
+
+        self.cleanup = cleanup;
+
+        self.blocks.push(Block {
+            body: mem::replace(&mut self.src, body),
+            results: mem::take(operands),
+            element,
+            base,
+        });
         todo!()
     }
 
     fn sizes(&self) -> &SizeAlign {
-        &self.gen.sizes
+        &self.gen.gen.sizes
     }
 
-    fn is_list_canonical(&self, iface: &Interface, element: &Type) -> bool {
-        todo!()
+    fn is_list_canonical(&self, _resolve: &Resolve, element: &Type) -> bool {
+        is_primitive(element)
     }
 }
 
@@ -1130,7 +1356,7 @@ fn indent(code: &str) -> String {
         } else {
             was_empty = false;
         }
-
+        println!("{code}");
         if trimmed.starts_with('}') {
             indent -= 1;
         }
