@@ -27,7 +27,6 @@ fn verify(dir: &Path, name: &str) {
     // For C#, we're only generating some different C code + additional C# files
     // This function should be similar to the C one
     // Look to dotnet-wasi-sdk build tasks to make sure
-    todo!();
     let path = PathBuf::from(env::var_os("WASI_SDK_PATH").unwrap());
     let mut cmd = Command::new(path.join("bin/clang"));
     cmd.arg("--sysroot").arg(path.join("share/wasi-sysroot"));
